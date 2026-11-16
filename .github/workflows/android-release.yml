@@ -107,9 +107,9 @@ jobs:
       - name: Install Node Dependencies
         run: |
           if [ -f package-lock.json ]; then
-            npm ci --no-audit --no-fund
+            npm ci --legacy-peer-deps --no-audit --no-fund
           else
-            npm install --no-audit --no-fund
+            npm install --legacy-peer-deps --no-audit --no-fund
           fi
 
       - name: TypeScript Lint & Vite Production Build
@@ -163,13 +163,15 @@ jobs:
 
           "$BUILD_TOOLS_DIR/apksigner" verify --verbose --print-certs "$APK_PATH"
 
-          BADGING=$("$BUILD_TOOLS_DIR/aapt2" dump badging "$APK_PATH")
-          echo "$BADGING" | head -n 10
-          echo "$BADGING" | grep -q "name='com.alhussam.grocery'"
-          echo "$BADGING" | grep -q "versionCode='1'"
-          echo "$BADGING" | grep -q "versionName='71.0.0'"
+          "$BUILD_TOOLS_DIR/aapt2" dump badging "$APK_PATH" > /tmp/badging.txt
+          head -n 10 /tmp/badging.txt
+          grep -q "name='com.alhussam.grocery'" /tmp/badging.txt
+          grep -q "versionCode='1'" /tmp/badging.txt
+          grep -q "versionName='71.0.0'" /tmp/badging.txt
 
-          jarsigner -verify -certs "$AAB_PATH" | head -n 10
+          jarsigner -verify -certs "$AAB_PATH" > /tmp/jarsigner.txt
+          head -n 10 /tmp/jarsigner.txt
+          grep -q "jar verified." /tmp/jarsigner.txt
 
           mkdir -p release-artifacts
           cp "$APK_PATH" release-artifacts/app-release.apk

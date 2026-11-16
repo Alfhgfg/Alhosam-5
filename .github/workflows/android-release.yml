@@ -1,0 +1,202 @@
+name: Android Release Build (APK & AAB)
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths-ignore:
+      - 'public/downloads/**'
+      - '**.md'
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'إنشاء GitHub Release وإرفاق APK و AAB'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-android:
+    name: Build Signed APK & AAB
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Cache npm dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('package.json', 'bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-
+
+      - name: Setup Java 21 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK Platform 36 & Build-Tools 35.0.0
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platform-tools" "platforms;android-36" "build-tools;35.0.0"
+
+      - name: Setup Gradle Cache
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-home-cache-cleanup: true
+
+      - name: Install Node Dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --no-audit --no-fund
+          else
+            npm install --no-audit --no-fund
+          fi
+
+      - name: TypeScript Lint & Vite Production Build
+        run: |
+          npm run lint
+          npm run build
+
+      - name: Sync Capacitor Android Project
+        run: npx cap sync android
+
+      - name: Prepare Gradle Wrapper, Android SDK Path & Keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          chmod +x android/gradlew
+          printf 'sdk.dir=%s\n' "${ANDROID_HOME}" > android/local.properties
+
+          if [ -n "${KEYSTORE_BASE64:-}" ]; then
+            printf '%s' "${KEYSTORE_BASE64}" | base64 -d > android/alhussam-release.keystore
+          fi
+
+          if [ -n "${KEYSTORE_PASSWORD:-}" ] && [ -n "${KEY_ALIAS:-}" ] && [ -n "${KEY_PASSWORD:-}" ]; then
+            printf 'storeFile=alhussam-release.keystore\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
+              "${KEYSTORE_PASSWORD}" "${KEY_ALIAS}" "${KEY_PASSWORD}" > android/keystore.properties
+          fi
+
+          test -s android/alhussam-release.keystore
+          test -s android/keystore.properties
+
+      - name: Build Signed Release APK & AAB
+        working-directory: android
+        run: |
+          ./gradlew assembleRelease bundleRelease \
+            --no-daemon \
+            --max-workers=1 \
+            -Dorg.gradle.jvmargs="-Xmx1536m -XX:MaxMetaspaceSize=512m -Dfile.encoding=UTF-8"
+
+      - name: Verify APK & AAB Integrity, Signature, Package & Version
+        run: |
+          APK_PATH="android/app/build/outputs/apk/release/app-release.apk"
+          AAB_PATH="android/app/build/outputs/bundle/release/app-release.aab"
+
+          test -s "$APK_PATH"
+          test -s "$AAB_PATH"
+
+          BUILD_TOOLS_DIR=$(ls -d "${ANDROID_HOME}"/build-tools/* | sort -V | tail -n 1)
+          echo "Using build-tools at: $BUILD_TOOLS_DIR"
+
+          "$BUILD_TOOLS_DIR/apksigner" verify --verbose --print-certs "$APK_PATH"
+
+          BADGING=$("$BUILD_TOOLS_DIR/aapt2" dump badging "$APK_PATH")
+          echo "$BADGING" | head -n 10
+          echo "$BADGING" | grep -q "name='com.alhussam.grocery'"
+          echo "$BADGING" | grep -q "versionCode='1'"
+          echo "$BADGING" | grep -q "versionName='71.0.0'"
+
+          jarsigner -verify -certs "$AAB_PATH" | head -n 10
+
+          mkdir -p release-artifacts
+          cp "$APK_PATH" release-artifacts/app-release.apk
+          cp "$AAB_PATH" release-artifacts/app-release.aab
+          sha256sum release-artifacts/app-release.apk release-artifacts/app-release.aab > release-artifacts/SHA256SUMS.txt
+          ls -lh release-artifacts/
+          cat release-artifacts/SHA256SUMS.txt
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-apk
+          path: release-artifacts/app-release.apk
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Upload AAB Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-aab
+          path: release-artifacts/app-release.aab
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Upload Combined Release Bundle & Checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: alhussam-android-release
+          path: release-artifacts/
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Write Build Summary
+        run: |
+          APK_SIZE=$(stat -c%s release-artifacts/app-release.apk)
+          AAB_SIZE=$(stat -c%s release-artifacts/app-release.aab)
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          {
+            echo "## بقالة الحسام - نتائج بناء Android"
+            echo ""
+            echo "- **Package Name:** \`com.alhussam.grocery\`"
+            echo "- **Version Name:** \`71.0.0\` (\`versionCode: 1\`)"
+            echo "- **APK Size:** \`${APK_SIZE}\` bytes"
+            echo "- **AAB Size:** \`${AAB_SIZE}\` bytes"
+            echo "- **Run & Artifacts URL:** ${RUN_URL}"
+            echo ""
+            echo "### SHA-256 Checksums"
+            echo '```'
+            cat release-artifacts/SHA256SUMS.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish GitHub Release (Optional on Manual Dispatch)
+        if: inputs.create_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v71.0.0-run-{0}', github.run_number) }}
+          name: "بقالة الحسام v71.0.0"
+          files: |
+            release-artifacts/app-release.apk
+            release-artifacts/app-release.aab
+            release-artifacts/SHA256SUMS.txt
